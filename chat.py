@@ -17,7 +17,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 import random
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA chat")
-    parser.add_argument("--version", default="runs/lisa-em-qa-lora-lr1e-5")
+    parser.add_argument("--version", default="/mnt/shared-storage-user/ai4sdata2-share/caijinyu/runs/lisa-em-qa-lora-lr1e-5")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
@@ -30,7 +30,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/mnt/shared-storage-user/caijinyu/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
@@ -125,7 +125,7 @@ def main(args):
     vision_tower.to(dtype=torch_dtype)
 
     if args.precision == "bf16":
-        model = model.bfloat16().cuda()
+        model = model.bfloat16().cuda() if torch.cuda.is_available() else model.bfloat16()
     elif (
         args.precision == "fp16" and (not args.load_in_4bit) and (not args.load_in_8bit)
     ):
@@ -145,7 +145,7 @@ def main(args):
         model = model.float().cuda()
 
     vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(device=args.local_rank)
+    vision_tower.to(device=args.local_rank) if torch.cuda.is_available() else vision_tower.to(device="cpu")
 
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
@@ -198,7 +198,7 @@ def main(args):
             ][0]
             .unsqueeze(0)
             .cuda()
-        )
+        ) if torch.cuda.is_available() else clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0].unsqueeze(0)
         if args.precision == "bf16":
             image_clip = image_clip.bfloat16()
         elif args.precision == "fp16":
@@ -213,7 +213,7 @@ def main(args):
             preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
             .unsqueeze(0)
             .cuda()
-        )
+        ) if torch.cuda.is_available() else preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous()).unsqueeze(0)
         if args.precision == "bf16":
             image = image.bfloat16()
         elif args.precision == "fp16":
@@ -222,7 +222,7 @@ def main(args):
             image = image.float()
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).cuda()
+        input_ids = input_ids.unsqueeze(0).cuda() if torch.cuda.is_available() else input_ids.unsqueeze(0)
 
         output_ids, pred_masks = model.evaluate(
             image_clip,

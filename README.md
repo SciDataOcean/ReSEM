@@ -4,7 +4,7 @@
 
 <font size=7><div align='center'>
     <a href="https://arxiv.org/pdf/2308.00692.pdf"><strong>📄 Paper</strong></a> | 
-    <a href="https://huggingface.co/cjyhgface"><strong>🤗 Models</strong></a> | 
+    <a href="https://huggingface.co/SciDataOcean"><strong>🤗 Models</strong></a> | 
     <a href="#training"><strong>🛠️ Training</strong></a> | 
     <a href="#inference"><strong>🔍 Inference</strong></a> | 
     <a href="#dataset"><strong>🗂️ Dataset</strong></a>
@@ -87,7 +87,7 @@ pip install flash-attn --no-build-isolation
 ```
 
 ## Dataset
-The ReasonEM dataset can be downloaded from [this link](https://huggingface.co/datasets/cjyhgface/ReasonEM).
+The ReasonEM dataset can be downloaded from [this link](https://huggingface.co/datasets/SciDataOcean/ReasonEM).
 
 ## Training
 ### Data Preparation
@@ -222,7 +222,7 @@ deepspeed --master_port=24999 train_ds.py \
  
 ## Inference 
 
-To chat with [ReSEM-13B-llama2-sft](https://huggingface.co/cjyhgface/ReSEM-13B-sft) or [ReSEM-13B-llama2-grpo](https://huggingface.co/cjyhgface/ReSEM-13B-rft):
+To chat with [ReSEM-13B-llama2-sft](https://huggingface.co/SciDataOcean/ReSEM-13B-sft) or [ReSEM-13B-llama2-grpo](https://huggingface.co/SciDataOcean/ReSEM-13B-rft):
 ```
 CUDA_VISIBLE_DEVICES=0 python batch_chat.py --version='ReSEM-13B-llama2-xxx'
 python batch_chat.py --precision='bf16' \

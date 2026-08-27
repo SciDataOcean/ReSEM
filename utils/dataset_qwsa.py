@@ -66,7 +66,8 @@ class ReasonSegDatasetQWSA_EM(torch.utils.data.Dataset):
         # prepare self.img_to_explanation for all datasets
         for data in reason_seg_data_ls:
             if use_gpt_qa:
-                json_path=os.path.join(base_data_dir,  data, f"{splits}_d_qa.json") 
+                # json_path=os.path.join(base_data_dir,  data, f"{splits}_d_qa.json") 
+                json_path=os.path.join(base_data_dir,  data, f"{splits}_revised.json") 
             else:
                 json_path=os.path.join(base_data_dir,  data, f"{splits}.json")
             json_data=json.load(open(json_path))
@@ -347,6 +348,8 @@ def collate_fn_qwsa(
         "classes_list": sampled_classes_list,
         "prompt_ids": prompt_ids,
         "attention_masks_prompts": attention_masks_prompts,
+        # needed by qwen3.5
+        "mm_token_type_ids": inputs.get("mm_token_type_ids"),
     }
     
     if image_grid_thw is not None:

@@ -23,13 +23,64 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOK
 import pdb
 import traceback
 import torch.nn as nn
+import random
 
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
     print()
-    pdb.pm()
+    if os.getenv("RESEM_DEBUG_PDB", "0") == "1":
+        pdb.pm()
 
 sys.excepthook = info
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def normalize_checkpoint_key(key):
+    for prefix in ("module.",):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+    return key
+
+
+def compatible_load_state_dict(src, dst):
+    dst_state = dst.state_dict()
+    normalized = {}
+    loaded = 0
+    skipped = 0
+
+    for key, value in src.items():
+        key = normalize_checkpoint_key(key)
+        candidates = [
+            key,
+            key[len("base_model."):] if key.startswith("base_model.") else None,
+            "base_model." + key if not key.startswith("base_model.") else None,
+            "base_model.model." + key if not key.startswith("base_model.model.") else None,
+        ]
+        matched_key = None
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if candidate in dst_state and dst_state[candidate].shape == value.shape:
+                matched_key = candidate
+                break
+        if matched_key is None:
+            skipped += 1
+            continue
+        normalized[matched_key] = value
+        loaded += 1
+
+    missing, unexpected = dst.load_state_dict(normalized, strict=False)
+    print(
+        "compatible checkpoint load: loaded {}, skipped {}, missing {}, unexpected {}".format(
+            loaded, skipped, len(missing), len(unexpected)
+        )
+    )
 
 
 
@@ -86,6 +137,7 @@ def parse_args(args):
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -137,10 +189,12 @@ def parse_args(args):
 
 def main(args):
     args = parse_args(args)
+    set_random_seed(args.seed)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
+        print("seed: {}".format(args.seed))
     else:
         writer = None
 
@@ -148,12 +202,13 @@ def main(args):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
         model_max_length=args.model_max_length,
-        padding_side="right",
+        padding_side="left" if args.eval_only else "right",
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.default_im_start_token_idx = tokenizer(DEFAULT_IM_START_TOKEN, add_special_tokens=False).input_ids[0]
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -178,7 +233,9 @@ def main(args):
         torch_dtype = torch.half
     model = LISAForCausalLM.from_pretrained(
         args.version,
-        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+        torch_dtype=torch_dtype, low_cpu_mem_usage=True, 
+        default_im_start_token_idx=args.default_im_start_token_idx,
+        **model_args
     )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -190,8 +247,7 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=args.local_rank)
-    if not args.eval_only:
-        model.get_model().initialize_lisa_modules(model.get_model().config)
+    model.get_model().initialize_lisa_modules(model.get_model().config)
 
     for p in vision_tower.parameters():
         p.requires_grad = False
@@ -203,7 +259,7 @@ def main(args):
     ]
 
     lora_r = args.lora_r if not args.train_mask_decoder_only else 0
-    if args.full_finetune or args.full_from_scratch or args.eval_only or args.lora_module_full_finetune:
+    if args.full_finetune or args.full_from_scratch or args.lora_module_full_finetune:
         lora_r = 0
     if lora_r > 0:
 
@@ -452,12 +508,23 @@ def main(args):
             args.resume = resume
 
     if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
+        if args.eval_only:
+            load_path, client_state = model_engine.load_checkpoint(
+                args.resume,
+                load_module_strict=False,
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_only=True,
+                custom_load_fn=compatible_load_state_dict,
+            )
+        else:
+            load_path, client_state = model_engine.load_checkpoint(args.resume)
         with open(os.path.join(args.resume, "latest"), "r") as f:
             ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
+        if not args.eval_only:
+            args.start_epoch = (
+                int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+            )
         print(
             "resume training from {}, start from epoch {}".format(
                 args.resume, args.start_epoch
@@ -492,7 +559,12 @@ def main(args):
     if args.eval_only:
         if args.score_text:
             # import pdb; pdb.set_trace()
-            giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
+            prev_padding_side = tokenizer.padding_side
+            tokenizer.padding_side = "left"
+            try:
+                giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
+            finally:
+                tokenizer.padding_side = prev_padding_side
             print(giou,ciou,text_metrics)
         else:
             giou, ciou = validate(val_loader, model_engine, 0, writer, args)
@@ -514,7 +586,12 @@ def main(args):
 
         if args.no_eval == False:
             if args.score_text:
-                giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
+                prev_padding_side = tokenizer.padding_side
+                tokenizer.padding_side = "left"
+                try:
+                    giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
+                finally:
+                    tokenizer.padding_side = prev_padding_side
             else:
                 giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
                 text_metrics={}
@@ -611,7 +688,7 @@ def main(args):
                 **training_config
             )
             if args.no_eval == False:
-                giou, ciou = validate(val_loader, model, 0, writer, args)
+                giou, ciou, _ = validate_text(val_loader, model, 0, writer, args)
                 is_best = giou > best_score
                 best_score = max(giou, best_score)
                 cur_ciou = ciou if is_best else cur_ciou
@@ -817,7 +894,7 @@ def validate(val_loader, model_engine, epoch, writer, args):
     return giou, ciou
 
 
-def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
+def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args, validate_rate=0.1):
     '''
     加入text相关指标
     '''
@@ -825,18 +902,19 @@ def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
     f1_meter = AverageMeter("F1", ":6.3f", Summary.SUM)
-    bleu_meter=AverageMeter("Bleu", ":6.3f", Summary.SUM)
-    cider_meter=AverageMeter("CIDEr", ":6.3f", Summary.SUM)
-    bertscorep_meter=AverageMeter("BERTScore_P", ":6.3f", Summary.SUM)
-    bertscorer_meter=AverageMeter("BERTScore_R", ":6.3f", Summary.SUM)
-    bertscoref1_meter=AverageMeter("BERTScore_F1", ":6.3f", Summary.SUM)
-
+    # bleu_meter=AverageMeter("Bleu", ":6.3f", Summary.SUM)
+    # cider_meter=AverageMeter("CIDEr", ":6.3f", Summary.SUM)
+    # bertscorep_meter=AverageMeter("BERTScore_P", ":6.3f", Summary.SUM)
+    # bertscorer_meter=AverageMeter("BERTScore_R", ":6.3f", Summary.SUM)
+    # bertscoref1_meter=AverageMeter("BERTScore_F1", ":6.3f", Summary.SUM)
 
     model_engine.eval()
 
     for input_dict in tqdm.tqdm(val_loader):
         torch.cuda.empty_cache()
-
+        random_num = random.random()
+        if random_num > validate_rate:
+            continue
         input_dict = dict_to_cuda(input_dict)
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
@@ -850,12 +928,14 @@ def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
 
         
         for i in range(len(input_dict["input_ids"])):
+            prompt_ids_i = input_dict["prompt_ids"][i]
+            prompt_ids_i = prompt_ids_i[prompt_ids_i != tokenizer.pad_token_id]
             
             with torch.no_grad():
-                output_ids, pred_masks = model_engine.evaluate(
+                output_ids, pred_masks = model_engine.module.evaluate(
                     input_dict["images_clip"],
                     input_dict["images"],
-                    input_dict["prompt_ids"][i].unsqueeze(0),
+                    prompt_ids_i.unsqueeze(0),
                     input_dict["resize_list"],
                     # input_dict["resize_list"],
                     [(input_dict["masks_list"][0].shape[1], input_dict["masks_list"][0].shape[2])],
@@ -869,7 +949,7 @@ def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
             text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
             text_output = text_output.replace("\n", "").replace("  ", " ").replace('<unk>', '')
             text_output = text_output.split('ASSISTANT: ')[-1]
-            text_output_gt = input_dict["conversation_list"][i].split('ASSISTANT: ')[-1] # todo
+            # text_output_gt = input_dict["conversation_list"][i].split('ASSISTANT: ')[-1] # todo
             target_name=input_dict["classes_list"][0][i]
             f1=1.0 if target_name.replace("_", " ").lower() in text_output.lower() else 0.0
             f1_meter.update(f1)
@@ -887,48 +967,50 @@ def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
             acc_iou_meter.update(acc_iou, n=1)
 
             # import pdb; pdb.set_trace()
-            text_metrics=evaluate_text_metrics(candidate=text_output, reference=text_output_gt)
-            bleu_meter.update(text_metrics['BLEU'])
-            cider_meter.update(text_metrics['CIDEr'])
-            bertscorep_meter.update(text_metrics['BERTScore_P'])
-            bertscorer_meter.update(text_metrics['BERTScore_R'])
-            bertscoref1_meter.update(text_metrics['BERTScore_F1'])
+            # text_metrics=evaluate_text_metrics(candidate=text_output, reference=text_output_gt)
+            # bleu_meter.update(text_metrics['BLEU'])
+            # cider_meter.update(text_metrics['CIDEr'])
+            # bertscorep_meter.update(text_metrics['BERTScore_P'])
+            # bertscorer_meter.update(text_metrics['BERTScore_R'])
+            # bertscoref1_meter.update(text_metrics['BERTScore_F1'])
 
     intersection_meter.all_reduce()
     union_meter.all_reduce()
     acc_iou_meter.all_reduce()
-    bleu_meter.all_reduce()
-    cider_meter.all_reduce()
-    bertscorep_meter.all_reduce()
-    bertscorer_meter.all_reduce()
-    bertscoref1_meter.all_reduce()
+    # bleu_meter.all_reduce()
+    # cider_meter.all_reduce()
+    # bertscorep_meter.all_reduce()
+    # bertscorer_meter.all_reduce()
+    # bertscoref1_meter.all_reduce()
     f1_meter.all_reduce()
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1]
     giou = acc_iou_meter.avg[1]
 
-    bleu= bleu_meter.avg
-    cider = cider_meter.avg
-    bertscorep = bertscorep_meter.avg
-    bertscorer = bertscorer_meter.avg
-    bertscoref1 = bertscoref1_meter.avg
+    # bleu= bleu_meter.avg
+    # cider = cider_meter.avg
+    # bertscorep = bertscorep_meter.avg
+    # bertscorer = bertscorer_meter.avg
+    # bertscoref1 = bertscoref1_meter.avg
     f1= f1_meter.avg
 
     if args.local_rank == 0 and writer:
         writer.add_scalar("val/giou", giou, epoch)
         writer.add_scalar("val/ciou", ciou, epoch)
-        writer.add_scalar("val/bleu", bleu, epoch)
-        writer.add_scalar("val/cider", cider, epoch)
-        writer.add_scalar("val/bertscorep", bertscorep, epoch)
-        writer.add_scalar("val/bertscorer", bertscorer, epoch)
-        writer.add_scalar("val/bertscoref1", bertscoref1, epoch)
+        writer.add_scalar("val/f1", f1, epoch)
+        # writer.add_scalar("val/bleu", bleu, epoch)
+        # writer.add_scalar("val/cider", cider, epoch)
+        # writer.add_scalar("val/bertscorep", bertscorep, epoch)
+        # writer.add_scalar("val/bertscorer", bertscorer, epoch)
+        # writer.add_scalar("val/bertscoref1", bertscoref1, epoch)
         print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
-        print("bleu: {:.4f}, cider: {:.4f}".format(bleu, cider))
-        print("bert score p: {:.4f}, r: {:.4f}, f1: {:.4f}".format(bertscorep, bertscorer, bertscoref1))
+        # print("bleu: {:.4f}, cider: {:.4f}".format(bleu, cider))
+        # print("bert score p: {:.4f}, r: {:.4f}, f1: {:.4f}".format(bertscorep, bertscorer, bertscoref1))
         print("f1: {:.4f}".format(f1))
 
-    return giou, ciou, {'bleu': bleu, 'cider': cider, 'bert_score_p': bertscorep, 'bert_score_r': bertscorer, 'bert_score_f1': bertscoref1, 'f1': f1}
+    # return giou, ciou, {'bleu': bleu, 'cider': cider, 'bert_score_p': bertscorep, 'bert_score_r': bertscorer, 'bert_score_f1': bertscoref1, 'f1': f1}
+    return giou, ciou, {'f1': f1}
 
 if __name__ == "__main__":
     main(sys.argv[1:])

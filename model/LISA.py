@@ -151,6 +151,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             config.mm_vision_tower = config.vision_tower
             
         self.seg_token_idx = kwargs.pop("seg_token_idx")
+        self.default_im_start_token_idx = kwargs.pop("default_im_start_token_idx")
 
         super().__init__(config)
 
@@ -489,6 +490,28 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             'output_ids':output_ids, # 需要pad成相同长度
             'pred_low_res_masks':pred_low_res_masks, # 需要变成张量
         }
+    
+    @staticmethod
+    def _align_seg_token_mask(seg_token_mask: torch.Tensor, last_hidden_state: torch.Tensor) -> torch.Tensor:
+        """
+        对齐 seg_token_mask 到 last_hidden_state 的 token 长度维。
+        规则：右对齐（保留末尾），避免 generate 仅返回输出段 hidden_states 时越界。
+        """
+        # seg_token_mask: [B, Lm], last_hidden_state: [B, Lh, C]
+        Lm = seg_token_mask.shape[1]
+        Lh = last_hidden_state.shape[1]
+
+        if Lm > Lh:
+            seg_token_mask = seg_token_mask[:, -Lh:]
+        elif Lm < Lh:
+            pad = torch.zeros(
+                (seg_token_mask.shape[0], Lh - Lm),
+                dtype=torch.bool,
+                device=seg_token_mask.device,
+            )
+            seg_token_mask = torch.cat([pad, seg_token_mask], dim=1)
+
+        return seg_token_mask
 
     def evaluate(
         self,
@@ -499,7 +522,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         original_size_list,
         max_new_tokens=32,
         tokenizer=None,
+        return_similarity=False,
     ):
+        # import pdb; pdb.set_trace()
+        # tokenizer.decode(torch.clamp(input_ids[0],min=0).tolist(), skip_special_tokens=False)
         with torch.no_grad():
             outputs = self.generate(
                 images=images_clip,
@@ -519,6 +545,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             output_ids = outputs.sequences
 
             seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+            for i in range(seg_token_mask.shape[0]):
+                if seg_token_mask[i].sum() == 0:
+                    # 把 seg_token_mask[i] 的最后一个 token 设为 True
+                    seg_token_mask[i][-1] = True
             # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
             seg_token_mask = torch.cat(
                 [
@@ -535,6 +565,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
             # import pdb; pdb.set_trace()
+            seg_token_mask = self._align_seg_token_mask(seg_token_mask, last_hidden_state)
+
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
@@ -579,4 +611,111 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 )
                 pred_masks.append(pred_mask[:, 0])
 
-        return output_ids, pred_masks
+                if return_similarity:
+                    similarity_map = self.similarity(
+                        output_hidden_states=output_hidden_states,
+                        seg_token_mask=seg_token_mask,
+                        offset=seg_token_offset,
+                        input_ids=output_ids,
+                        sam_mask_shape_list=original_size_list,
+                    )
+                    return output_ids, pred_masks, similarity_map
+                else:
+                    return output_ids, pred_masks
+
+    def similarity(
+            self, 
+            output_hidden_states, 
+            seg_token_mask,
+            offset,
+            input_ids, 
+            sam_mask_shape_list,
+    ):
+        
+        # def get_similarity_map(sm, shape):
+        #     # min-max norm
+        #     sm = (sm - sm.min(1, keepdim=True)[0]) / (sm.max(1, keepdim=True)[0] - sm.min(1, keepdim=True)[0])
+        #     # reshape
+        #     side = int(sm.shape[1] ** 0.5) # square output
+        #     sm = sm.reshape(sm.shape[0], side, side, -1).permute(0, 3, 1, 2)
+        #     # interpolate
+        #     sm = sm.to(torch.float32)
+
+        #     target_size = 336
+        #     h, w = shape
+        #     scale = target_size / min(h, w)
+        #     new_h, new_w = int(h * scale), int(w * scale)
+        #     sm = torch.nn.functional.interpolate(sm, (target_size, target_size), mode='bilinear')
+        #     pad_h = (new_h - target_size) // 2
+        #     pad_w = (new_w - target_size) // 2
+        #     padded_sm = F.pad(sm, (pad_w, pad_w, pad_h, pad_h))
+        #     sm = torch.nn.functional.interpolate(padded_sm, shape, mode='bilinear')
+        #     sm = sm.permute(0, 2, 3, 1)
+        #     import pdb; pdb.set_trace()
+        #     return sm
+
+        def get_similarity_map(sm, shape):
+            # min-max norm
+            sm = (sm - sm.min(1, keepdim=True)[0]) / (sm.max(1, keepdim=True)[0] - sm.min(1, keepdim=True)[0])
+            
+            # reshape
+            side = int(sm.shape[1] ** 0.5)  # square output
+            sm = sm.reshape(sm.shape[0], side, side, -1).permute(0, 3, 1, 2)
+            
+            # interpolate to target shape
+            sm = sm.to(torch.float32)
+            sm = torch.nn.functional.interpolate(sm, size=shape, mode='bilinear', align_corners=False)
+            
+            # permute back to original format
+            sm = sm.permute(0, 2, 3, 1)
+            return sm
+
+        def compute_similarity_map(
+            image_features, 
+            text_features, 
+            redundant_feats=None
+        ):  
+            """see also: https://github.com/rui-qian/CLIP_Surgery/blob/master/demo.py"""
+            if redundant_feats != None:
+                similarity = image_features @ (text_features - redundant_feats).t()
+            else:
+                image_features = image_features.clone()
+                text_features = text_features.clone()
+                prob = image_features[:, :1, :] @ text_features.t()
+                prob = (prob * 2).softmax(-1)
+                w = prob / prob.mean(-1, keepdim=True)
+                b, n_t, n_i, c = image_features.shape[0], text_features.shape[0], \
+                    image_features.shape[1], image_features.shape[2]
+                feats = image_features.reshape(b, n_i, 1, c) * text_features.reshape(1, 1, n_t, c)
+                feats *= w.reshape(1, 1, n_t, 1)
+                # sum the element-wise multiplied features as cosine similarity
+                similarity = feats.sum(-1)
+            return similarity
+        
+        images_size_list = []
+        for i in range(len(offset) - 1):
+            start_i, end_i = offset[i], offset[i + 1]
+            images_size_list.extend([sam_mask_shape_list[i][1]] * (end_i - start_i))
+
+        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+        image_embedding_tokens = output_hidden_states[seg_token_counts==1]
+        seg_embedding_tokens = output_hidden_states[seg_token_mask]
+                
+        similarity_maps = []
+        for bs in range(len(image_embedding_tokens)):
+            default_im_start_token_idx = torch.where(
+                input_ids==self.default_im_start_token_idx
+            )[1][0].item()
+
+            similarity = compute_similarity_map(
+                image_embedding_tokens [ 
+                    bs: bs+1, 
+                    default_im_start_token_idx + 1: default_im_start_token_idx + 1 \
+                    + self.get_vision_tower().num_patches, :
+                ],
+                seg_embedding_tokens[bs: bs + 1, ...]
+            )
+            similarity_map = get_similarity_map(similarity, sam_mask_shape_list[bs])
+            similarity_maps.append(similarity_map)
+        return similarity_maps
+

@@ -28,7 +28,7 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
-from model.LISA_qwen import LISAQwenForCausalLM
+# from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn_grpo, ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX, 
@@ -37,6 +37,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOK
 import pdb
 import traceback
 import torch.nn as nn
+import random
 
 from model.grpo.data_parallel_ds import train_with_grpo, train_with_grpo_epoch
 from model.grpo.utils import optimize_model_memory
@@ -50,6 +51,77 @@ def info(type, value, tb):
     pdb.pm()
 
 sys.excepthook = info
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def find_lora_linear_layers(model, lora_target_modules):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if (
+            isinstance(module, cls)
+            and all(
+                x not in name
+                for x in [
+                    "visual_model",
+                    "vision_tower",
+                    "mm_projector",
+                    "text_hidden_fcs",
+                ]
+            )
+            and any(x in name for x in lora_target_modules)
+        ):
+            lora_module_names.add(name)
+    return sorted(list(lora_module_names))
+
+
+def normalize_checkpoint_key(key):
+    prefixes = ("module.",)
+    for prefix in prefixes:
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+    return key
+
+
+def compatible_load_state_dict(src, dst):
+    dst_state = dst.state_dict()
+    normalized = {}
+    loaded = 0
+    skipped = 0
+
+    for key, value in src.items():
+        key = normalize_checkpoint_key(key)
+        candidates = [
+            key,
+            key[len("base_model."):] if key.startswith("base_model.") else None,
+            "base_model." + key if not key.startswith("base_model.") else None,
+            "base_model.model." + key if not key.startswith("base_model.model.") else None,
+        ]
+        matched_key = None
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if candidate in dst_state and dst_state[candidate].shape == value.shape:
+                matched_key = candidate
+                break
+        if matched_key is None:
+            skipped += 1
+            continue
+        normalized[matched_key] = value
+        loaded += 1
+
+    missing, unexpected = dst.load_state_dict(normalized, strict=False)
+    print_rank0(
+        "compatible checkpoint load: loaded {}, skipped {}, missing {}, unexpected {}".format(
+            loaded, skipped, len(missing), len(unexpected)
+        )
+    )
 
 
 def parse_tuple(input_str):
@@ -115,6 +187,7 @@ def parse_args(args):
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -157,7 +230,7 @@ def parse_args(args):
     parser.add_argument(
         "--reward_weights",
         nargs=4,  # 要求4个值
-        type=int,
+        type=float,
         default=[1, 1, 10, 1],
         help="Reward weights as 4 integers (default: 1 1 10 1)"
     )
@@ -167,6 +240,7 @@ def parse_args(args):
 def main(args):
     torch.cuda.empty_cache()
     args = parse_args(args)
+    set_random_seed(args.seed)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     os.makedirs(args.vis_save_path, exist_ok=True)
     if args.local_rank == 0:
@@ -194,6 +268,7 @@ def main(args):
 
     tokenizer.pad_token = tokenizer.unk_token
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.default_im_start_token_idx = tokenizer(DEFAULT_IM_START_TOKEN, add_special_tokens=False).input_ids[0]
 
 
     torch_dtype = torch.float32
@@ -243,6 +318,7 @@ def main(args):
             args.version, low_cpu_mem_usage=True, **kwargs
         )
     else:
+        kwargs["default_im_start_token_idx"] = args.default_im_start_token_idx
         model = LISAForCausalLM.from_pretrained(
             args.version, low_cpu_mem_usage=True, **kwargs
         )
@@ -278,6 +354,27 @@ def main(args):
     conversation_lib.default_conversation = conversation_lib.conv_templates[
         args.conv_type
     ]
+
+    lora_r = args.lora_r if not args.train_mask_decoder_only else 0
+    if args.full_finetune or args.full_from_scratch or args.eval_only or args.lora_module_full_finetune:
+        lora_r = 0
+    if lora_r > 0:
+        lora_target_modules = find_lora_linear_layers(
+            model, args.lora_target_modules.split(",")
+        )
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        if args.local_rank == 0:
+            model.print_trainable_parameters()
+
+    model.resize_token_embeddings(len(tokenizer))
 
     
     if args.train_mask_decoder_only:
@@ -474,11 +571,21 @@ def main(args):
                 args.resume = resume
 
     if args.resume:
-        import pdb; pdb.set_trace()
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
+        is_grpo_resume = "grpo" in args.resume
+        if is_grpo_resume:
+            load_path, client_state = model_engine.load_checkpoint(args.resume)
+        else:
+            load_path, client_state = model_engine.load_checkpoint(
+                args.resume,
+                load_module_strict=False,
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_only=True,
+                custom_load_fn=compatible_load_state_dict,
+            )
         with open(os.path.join(args.resume, "latest"), "r") as f:
             ckpt_dir = f.readlines()[0].strip()
-        if "grpo" in args.resume:
+        if is_grpo_resume:
             args.start_epoch = (
                 int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
             )
@@ -755,7 +862,6 @@ def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
     bertscoref1_meter.all_reduce()
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    pdb.set_trace()
     ciou = iou_class[1]
     giou = acc_iou_meter.avg[1]
 

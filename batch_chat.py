@@ -10,7 +10,7 @@ from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
 
 from model.LISA import LISAForCausalLM
 from model.LISA_qwen import LISAQwenForCausalLM
-from model.LISA_qwsa import QWSAForCausalLM
+# from model.LISA_qwsa import QWSAForCausalLM
 from model.llava.model.multimodal_encoder.siglip_encoder import SigLipVisionTower, SigLipImageProcessor
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
@@ -111,6 +111,7 @@ def main(args):
 
     tokenizer.pad_token = tokenizer.unk_token
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.default_im_start_token_idx = tokenizer(DEFAULT_IM_START_TOKEN, add_special_tokens=False).input_ids[0]
 
 
     torch_dtype = torch.float32
@@ -154,7 +155,7 @@ def main(args):
         )
     else:
         model = LISAForCausalLM.from_pretrained(
-            args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, **kwargs
+            args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, default_im_start_token_idx=args.default_im_start_token_idx,  **kwargs
         )
 
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -221,7 +222,7 @@ def main(args):
     
     model.eval()
 
-    def chat(prompt,image_path,class_name, answer=''):
+    def chat(prompt,image_path,class_name, answer='',return_similarity=True):
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
@@ -284,7 +285,7 @@ def main(args):
         input_ids = input_ids.unsqueeze(0).cuda()
         # if input_ids.shape[1]==1:
         # import pdb; pdb.set_trace()
-        output_ids, pred_masks = model.evaluate(
+        output_ids, pred_masks, similarity_map = model.evaluate(
             image_clip, # torch.Size([1, 3, 224, 224])
             image, # torch.Size([1, 3, 1024, 1024])
             input_ids, # torch.Size([1, 76])
@@ -292,7 +293,29 @@ def main(args):
             original_size_list, # [(3230, 4800)]
             max_new_tokens=512,
             tokenizer=tokenizer,
+            return_similarity=return_similarity
         )
+        if return_similarity:
+            for i, sim_map in enumerate(similarity_map):
+                sim_map = sim_map.detach().cpu().numpy()
+                # 提取通道维度 [H, W, C] -> [H, W]
+                sim_map = sim_map[0, ..., 0]
+                # 归一化到0-1
+                sim_map = (sim_map - sim_map.min()) / (sim_map.max() - sim_map.min() + 1e-8)
+                # 转换为0-255的单通道图
+                sim_map_uint8 = (sim_map * 255).astype(np.uint8)
+                # 应用热力图色彩映射 (Jet)
+                sim_map_color = cv2.applyColorMap(sim_map_uint8, cv2.COLORMAP_JET)
+                # 与原始图像混合：30% 原图 + 70% 热力图
+                blended = image_np * 0.3 + sim_map_color * 0.7
+                blended = blended.astype(np.uint8)
+                blended = cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
+
+                save_path = "{}/{}_similarity_map_{}.jpg".format(
+                    args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
+                )
+                cv2.imwrite(save_path, blended)
+                print("{} has been saved.".format(save_path))
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)

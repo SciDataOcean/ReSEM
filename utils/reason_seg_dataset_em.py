@@ -71,7 +71,8 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
         # prepare self.img_to_explanation for all datasets
         for data in reason_seg_data_ls:
             if use_gpt_qa:
-                json_path=os.path.join(base_data_dir,  data, f"{splits}_d_qa.json")
+                # json_path=os.path.join(base_data_dir,  data, f"{splits}_d_qa.json")
+                json_path=os.path.join(base_data_dir,  data, f"{splits}_revised.json")
             else:
                 json_path=os.path.join(base_data_dir,  data, f"{splits}.json")
             json_data=json.load(open(json_path))
@@ -98,8 +99,22 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
+        last_error = None
+        for _ in range(20):
+            candidate_idx = random.randint(0, len(self.json_data_list) - 1)
+            try:
+                return self._getitem_once(candidate_idx)
+            except Exception as exc:
+                last_error = exc
+                print(
+                    "WARNING: skip bad ReasonSegDataset_EM sample idx={} error={}".format(
+                        candidate_idx, repr(exc)
+                    )
+                )
+        raise last_error
+
+    def _getitem_once(self, idx):
         # images, jsons = self.reason_seg_data
-        idx = random.randint(0, len(self.json_data_list) - 1)
         image_path = self.json_data_list[idx]["image_path"]
         if "tiff" in image_path:
             image=cv2.imread(image_path,cv2.IMREAD_UNCHANGED)
@@ -130,15 +145,25 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
                else np.array(Image.open(os.path.join(self.json_data_list[idx]["data_root"], s["mask_name"])))!=0
                for s in self.json_data_list[idx]['shapes']]
             
-        if len(sents) >= self.num_classes_per_sample:
+        valid_count = min(len(sents), len(masks), len(self.json_data_list[idx]["shapes"]))
+        if valid_count <= 0:
+            raise ValueError("no valid text/mask/shape entries in {}".format(image_path))
+        if len(sents) != len(masks) or len(sents) != len(self.json_data_list[idx]["shapes"]):
+            print(
+                "WARNING: text/mask/shape length mismatch for {}: text={}, masks={}, shapes={}; using first {}".format(
+                    image_path, len(sents), len(masks), len(self.json_data_list[idx]["shapes"]), valid_count
+                )
+            )
+
+        if valid_count >= self.num_classes_per_sample:
             sampled_inds = np.random.choice(
-                list(range(len(sents))), size=self.num_classes_per_sample, replace=False
+                list(range(valid_count)), size=self.num_classes_per_sample, replace=False
             )
         else:
-            sampled_inds = list(range(len(sents)))
+            sampled_inds = list(range(valid_count))
         sampled_sents = np.vectorize(sents.__getitem__)(sampled_inds).tolist()
         sampled_masks = [
-            masks[i] for i in range(len(sampled_inds))
+            masks[int(i)] for i in sampled_inds
         ]
 
         image = self.transform.apply_image(image)  # preprocess image for sam
@@ -155,7 +180,9 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
         answers = []
         classes=[]
         
-        for i, text in enumerate(sampled_sents):
+        for i in sampled_inds:
+            i = int(i)
+            text = sents[i]
             if is_sentence:
                 question_template = random.choice(self.long_question_list)
                 if self.use_gpt_qa:

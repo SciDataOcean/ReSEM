@@ -8,6 +8,9 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
 from bert_score import score as bert_score
+from skimage.morphology import dilation, disk
+import cv2
+
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
@@ -284,3 +287,81 @@ def evaluate_text_metrics(candidate, reference, candidate_id="1"):
         "BERTScore_R": bert_R,
         "BERTScore_F1": bert_F1
     }
+
+def mask_to_boundary(mask, dilation_ratio=0.02):
+    """
+    Convert binary mask to boundary mask.
+    :param mask (numpy array, uint8): binary mask
+    :param dilation_ratio (float): ratio to calculate dilation = dilation_ratio * image_diagonal
+    :return: boundary mask (numpy array)
+    """
+    h, w = mask.shape
+    img_diag = np.sqrt(h ** 2 + w ** 2)
+    dilation = int(round(dilation_ratio * img_diag))
+    if dilation < 1:
+        dilation = 1
+    # Pad image so mask truncated by the image border is also considered as boundary.
+    new_mask = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    new_mask_erode = cv2.erode(new_mask, kernel, iterations=dilation)
+    mask_erode = new_mask_erode[1 : h + 1, 1 : w + 1]
+    # G_d intersects G in the paper.
+    return mask - mask_erode
+
+def compute_boundary_iou(gt_mask, pred_mask):
+    """
+    计算 gt_mask 和 pred_mask 的 Boundary IoU。
+    """
+    gt_boundary = mask_to_boundary(gt_mask)
+    pred_boundary = mask_to_boundary(pred_mask)
+
+    intersection = np.logical_and(gt_boundary, pred_boundary).sum()
+    union = np.logical_or(gt_boundary, pred_boundary).sum()
+
+    if union == 0:
+        return 0.0  # 避免除零错误
+
+    return intersection / union
+
+from medpy.metric.binary import __surface_distances
+
+def normalized_surface_dice(a: np.ndarray, b: np.ndarray, threshold: float = 0.5, spacing: tuple = None, connectivity=1):
+    """
+    This implementation differs from the official surface dice implementation! These two are not comparable!!!!!
+
+    The normalized surface dice is symmetric, so it should not matter whether a or b is the reference image
+
+    This implementation natively supports 2D and 3D images. Whether other dimensions are supported depends on the
+    __surface_distances implementation in medpy
+
+    :param a: image 1, must have the same shape as b
+    :param b: image 2, must have the same shape as a
+    :param threshold: distances below this threshold will be counted as true positives. Threshold is in mm, not voxels!
+    (if spacing = (1, 1(, 1)) then one voxel=1mm so the threshold is effectively in voxels)
+    must be a tuple of len dimension(a)
+    :param spacing: how many mm is one voxel in reality? Can be left at None, we then assume an isotropic spacing of 1mm
+    :param connectivity: see scipy.ndimage.generate_binary_structure for more information. I suggest you leave that
+    one alone
+    :return:
+    """
+    if np.sum(a) == 0 or np.sum(b) == 0:
+        return 0.0  # 如果任意一个掩码为空，直接返回 0.0
+
+    assert all([i == j for i, j in zip(a.shape, b.shape)]), "a and b must have the same shape. a.shape= %s, " \
+                                                            "b.shape= %s" % (str(a.shape), str(b.shape))
+    if spacing is None:
+        spacing = tuple([1 for _ in range(len(a.shape))])
+    a_to_b = __surface_distances(a, b, spacing, connectivity)
+    b_to_a = __surface_distances(b, a, spacing, connectivity)
+
+    numel_a = len(a_to_b)
+    numel_b = len(b_to_a)
+
+    tp_a = np.sum(a_to_b <= threshold) / numel_a
+    tp_b = np.sum(b_to_a <= threshold) / numel_b
+
+    fp = np.sum(a_to_b > threshold) / numel_a
+    fn = np.sum(b_to_a > threshold) / numel_b
+
+    dc = (tp_a + tp_b) / (tp_a + tp_b + fp + fn + 1e-8)  # 1e-8 just so that we don't get div by 0
+    return dc

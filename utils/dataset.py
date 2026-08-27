@@ -47,6 +47,8 @@ def collate_fn(
     resize_list = []
     questions_list = []
     sampled_classes_list = []
+    classes_list = []
+    prompts_list = []
     offset_list = [0]
     cnt = 0
     inferences = []
@@ -61,8 +63,8 @@ def collate_fn(
             resize,
             questions,
             sampled_classes,
-            _, # classes
-            _, # prompts
+            classes, # classes
+            prompts, # prompts
             inference,
         ) in batch:
             image_path_list.append(image_path)
@@ -74,6 +76,8 @@ def collate_fn(
             resize_list.append(resize)
             questions_list.append(questions)
             sampled_classes_list.append(sampled_classes)
+            classes_list.append(classes)
+            prompts_list.extend(prompts)
             cnt += len(conversations)
             offset_list.append(cnt)
             inferences.append(inference)
@@ -117,10 +121,18 @@ def collate_fn(
         tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         for prompt in conversation_list
     ]
+    prompt_ids=[
+        tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+        for prompt in prompts_list
+    ]
     input_ids = torch.nn.utils.rnn.pad_sequence(
         input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
     )
+    prompt_ids = torch.nn.utils.rnn.pad_sequence(
+        prompt_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+    )
     attention_masks = input_ids.ne(tokenizer.pad_token_id)
+    attention_masks_prompts=prompt_ids.ne(tokenizer.pad_token_id)
 
     conv = conversation_lib.default_conversation.copy()
     targets = input_ids.clone()
@@ -180,6 +192,9 @@ def collate_fn(
             input_ids = input_ids[:, :truncate_len]
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
+            prompt_ids = prompt_ids[:, :truncate_len]
+            attention_masks_prompts=attention_masks_prompts[:, :truncate_len]
+
 
     return {
         "image_paths": image_path_list,
@@ -196,6 +211,10 @@ def collate_fn(
         "sampled_classes_list": sampled_classes_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
+        "classes_list": classes_list,
+        "prompt_ids": prompt_ids,
+        "attention_masks_prompts": attention_masks_prompts,
+    
     }
 
 def collate_fn_grpo(
@@ -863,7 +882,8 @@ class ValDataset_EM(torch.utils.data.Dataset):
         self.json_data_list = []
         for data in reason_seg_data_ls:
             if use_gpt_qa:
-                json_path=os.path.join(base_image_dir,  data, f"{splits}_d_qa.json")
+                gpt_qa_suffix = os.getenv("RESEM_VAL_GPT_QA_SUFFIX", "d_qa")
+                json_path=os.path.join(base_image_dir,  data, f"{splits}_{gpt_qa_suffix}.json")
             else:
                 json_path=os.path.join(base_image_dir,  data, f"{splits}.json")
             json_data=json.load(open(json_path)) if os.path.exists(json_path) else []
@@ -950,7 +970,8 @@ class ValDataset_EM(torch.utils.data.Dataset):
         questions = []
         answers = []
         classes=[]
-        for i, text in enumerate(sampled_sents):
+        for i in range(len(self.json_data_list[idx]["shapes"])):
+            text=sampled_sents[i]
             if is_sentence:
                 question_template = random.choice(self.long_question_list)
                 if self.use_gpt_qa:
@@ -1059,10 +1080,10 @@ class ValDataset_EM(torch.utils.data.Dataset):
             label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
 
         # print("Masks shape: ", masks.shape, "selected_sents: ", len(sampled_sents))
-        assert masks.shape[0] == len(sampled_sents), (
-            masks.shape,
-            len(sampled_sents),
-        )
+        # assert masks.shape[0] == len(sampled_sents), (
+        #     masks.shape,
+        #     len(sampled_sents),
+        # )
         assert len(conversations)==len(prompts), (len(conversations), len(prompts))
         inference = True
         return (
